@@ -405,10 +405,16 @@ async fn execute(
     };
     let reservation = reserve(cfg, key, model).await?;
     let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let (mut outputs, mut input, mut output, mut finish_reason) = (Vec::new(), 0_u64, 0_u64, None);
     for messages in &batches {
-        match generate(cfg, &reservation, messages, max_tokens, temperature).await {
-            Ok((text, a, b, reason))
+        match tokio::time::timeout_at(
+            deadline,
+            generate(cfg, &reservation, messages, max_tokens, temperature),
+        )
+        .await
+        {
+            Ok(Ok((text, a, b, reason)))
                 if input + a <= i32::MAX as u64 && output + b <= i32::MAX as u64 =>
             {
                 outputs.push(text);
@@ -422,7 +428,7 @@ async fn execute(
                 } else {
                     (Some(input), Some(output))
                 };
-                let _ = finalize(
+                let recorded = finalize(
                     cfg,
                     &reservation.reservation_id,
                     false,
@@ -431,6 +437,13 @@ async fn execute(
                     started.elapsed().as_millis().min(i32::MAX as u128) as u64,
                 )
                 .await;
+                if !recorded {
+                    return Err(failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "USAGE_UNAVAILABLE",
+                        "Usage could not be recorded.",
+                    ));
+                }
                 return Err(failure(
                     StatusCode::BAD_GATEWAY,
                     "ENGINE_ERROR",
@@ -562,6 +575,8 @@ mod tests {
         calls: AtomicUsize,
         metered: AtomicUsize,
         fail_usage: AtomicBool,
+        fail_after: AtomicUsize,
+        partial_input: AtomicUsize,
     }
 
     async fn mock_reserve(req: HttpRequest, body: web::Json<Value>) -> HttpResponse {
@@ -604,6 +619,12 @@ mod tests {
         if body["status"] == "ok" {
             state.metered.fetch_add(1, Ordering::SeqCst);
         }
+        if body["status"] == "error" {
+            state.partial_input.store(
+                body["input_tokens"].as_u64().unwrap_or(0) as usize,
+                Ordering::SeqCst,
+            );
+        }
         HttpResponse::Ok().finish()
     }
 
@@ -611,7 +632,10 @@ mod tests {
         if body["model"] != "local" {
             return HttpResponse::BadRequest().finish();
         }
-        state.calls.fetch_add(1, Ordering::SeqCst);
+        let call = state.calls.fetch_add(1, Ordering::SeqCst);
+        if call >= state.fail_after.load(Ordering::SeqCst) {
+            return HttpResponse::BadGateway().finish();
+        }
         HttpResponse::Ok().json(
             json!({"choices": [{"message": {"content": "answer"}, "finish_reason": "length"}],
                                       "usage": {"prompt_tokens": 3, "completion_tokens": 2}}),
@@ -623,6 +647,8 @@ mod tests {
             calls: AtomicUsize::new(0),
             metered: AtomicUsize::new(0),
             fail_usage: AtomicBool::new(false),
+            fail_after: AtomicUsize::new(usize::MAX),
+            partial_input: AtomicUsize::new(0),
         });
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -748,6 +774,30 @@ mod tests {
         ] {
             assert!(loopback_origin(url).is_none());
         }
+    }
+
+    #[actix_web::test]
+    async fn failed_batch_records_completed_calls() {
+        let (gateway, state, handle) = setup().await;
+        state.fail_after.store(1, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two"]}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.partial_input.load(Ordering::SeqCst), 3);
+        handle.stop(false).await;
     }
 
     #[actix_web::test]
