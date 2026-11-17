@@ -24,9 +24,15 @@ async fn healthz() -> HttpResponse {
     })
 }
 
-/// Ready means able to serve. Until a model engine is wired in, fail readiness while preserving liveness.
-async fn readyz() -> HttpResponse {
-    HttpResponse::ServiceUnavailable().json(serde_json::json!({ "ok": false, "checks": { "engine": { "ok": false, "detail": "not configured yet" } } }))
+/// Readiness requires a configured authority and at least one responsive registered engine.
+async fn readyz(gateway: Option<web::Data<crate::gateway::Gateway>>) -> HttpResponse {
+    if let Some(gateway) = gateway {
+        if gateway.ready().await {
+            return HttpResponse::Ok()
+                .json(serde_json::json!({ "ok": true, "checks": { "engine": { "ok": true } } }));
+        }
+    }
+    HttpResponse::ServiceUnavailable().json(serde_json::json!({ "ok": false, "checks": { "engine": { "ok": false, "detail": "not configured or unavailable" } } }))
 }
 
 pub fn routes(cfg: &mut web::ServiceConfig) {
