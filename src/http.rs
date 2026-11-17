@@ -24,10 +24,9 @@ async fn healthz() -> HttpResponse {
     })
 }
 
-/// Ready means able to serve. With no model engine wired in yet, ready and healthy are the same; C10 adds a
-/// check that the llama.cpp engine answers.
+/// Ready means able to serve. Until a model engine is wired in, fail readiness while preserving liveness.
 async fn readyz() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "checks": { "engine": { "ok": true, "detail": "not configured yet" } } }))
+    HttpResponse::ServiceUnavailable().json(serde_json::json!({ "ok": false, "checks": { "engine": { "ok": false, "detail": "not configured yet" } } }))
 }
 
 pub fn routes(cfg: &mut web::ServiceConfig) {
@@ -106,20 +105,21 @@ mod tests {
     #[actix_web::test]
     async fn health_and_readiness_answer() {
         let app = test::init_service(App::new().wrap(RequestId).configure(routes)).await;
-        for path in ["/healthz", "/readyz"] {
-            let response =
-                test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
-            assert!(response.status().is_success(), "{path}");
-            assert!(
-                response.headers().contains_key(REQUEST_ID),
-                "{path} has no request id"
-            );
-        }
-        let body: serde_json::Value = test::call_and_read_body_json(
-            &app,
-            test::TestRequest::get().uri("/healthz").to_request(),
-        )
-        .await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/readyz").to_request()).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(response.headers().contains_key(REQUEST_ID));
+        let ready: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(ready["ok"], false);
+        assert_eq!(ready["checks"]["engine"]["ok"], false);
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/healthz").to_request()).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        assert!(response.headers().contains_key(REQUEST_ID));
+        let body: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(body["service"], "inference");
     }
 
