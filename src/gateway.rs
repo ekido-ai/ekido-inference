@@ -168,8 +168,8 @@ fn loopback_origin(value: &str) -> Option<Url> {
     Some(parsed)
 }
 
-fn failure(status: StatusCode, code: &'static str, detail: &'static str) -> HttpResponse {
-    HttpResponse::build(status).json(json!({"error": code, "detail": detail}))
+fn failure(status: StatusCode, code: &'static str, detail: &'static str) -> Box<HttpResponse> {
+    Box::new(HttpResponse::build(status).json(json!({"error": code, "detail": detail})))
 }
 
 fn api_key(req: &HttpRequest) -> Option<&str> {
@@ -212,7 +212,7 @@ async fn read_json(mut response: reqwest::Response) -> Result<Value, ()> {
     serde_json::from_slice(&data).map_err(|_| ())
 }
 
-async fn reserve(cfg: &Config, key: &str, model: &str) -> Result<Reservation, HttpResponse> {
+async fn reserve(cfg: &Config, key: &str, model: &str) -> Result<Reservation, Box<HttpResponse>> {
     let url = cfg
         .authority
         .join("/internal/inference/reserve")
@@ -376,7 +376,7 @@ async fn execute(
     batches: Vec<Vec<Message>>,
     max_tokens: u32,
     temperature: f64,
-) -> Result<Completed, HttpResponse> {
+) -> Result<Completed, Box<HttpResponse>> {
     let Some(key) = api_key(req) else {
         return Err(failure(
             StatusCode::UNAUTHORIZED,
@@ -474,7 +474,7 @@ async fn predict(
             .iter()
             .any(|v| v.is_empty() || v.len() > MAX_PROMPT)
     {
-        return failure(
+        return *failure(
             StatusCode::BAD_REQUEST,
             "INVALID_INPUT",
             "Supply 1 to 32 non-empty inputs of at most 8000 bytes.",
@@ -497,7 +497,7 @@ async fn predict(
                 json!({"outputs": done.outputs, "usage": {"input_tokens": done.input,
                          "output_tokens": done.output, "latency_ms": done.elapsed}}),
             ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -523,7 +523,7 @@ async fn chat(
         })
         || body.messages.iter().map(|m| m.content.len()).sum::<usize>() > 64_000
     {
-        return failure(
+        return *failure(
             StatusCode::BAD_REQUEST,
             "INVALID_INPUT",
             "Invalid chat request.",
@@ -537,7 +537,7 @@ async fn chat(
                 "content": done.outputs[0]}, "finish_reason": done.finish_reason}],
                 "usage": {"prompt_tokens": done.input, "completion_tokens": done.output,
                           "total_tokens": done.input + done.output}})),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
