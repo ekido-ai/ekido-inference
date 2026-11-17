@@ -153,7 +153,12 @@ impl Gateway {
 
 fn loopback_origin(value: &str) -> Option<Url> {
     let parsed = Url::parse(value).ok()?;
-    let host: IpAddr = parsed.host_str()?.parse().ok()?;
+    let host: IpAddr = parsed
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()?;
     if parsed.scheme() != "http"
         || !host.is_loopback()
         || parsed.port().is_none()
@@ -734,6 +739,7 @@ mod tests {
     #[actix_web::test]
     async fn only_numeric_loopback_origins_are_allowed() {
         assert!(loopback_origin("http://127.0.0.1:9000").is_some());
+        assert!(loopback_origin("http://[::1]:9000").is_some());
         for url in [
             "http://example.com:9000",
             "http://127.0.0.1:9000/path",
