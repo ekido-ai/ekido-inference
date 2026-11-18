@@ -1,8 +1,10 @@
 //! Customer inference routes. Authorization and usage are owned by Platform;
 //! only numeric loopback origins are accepted for the authority and model engines.
 use std::{
+    collections::{hash_map::RandomState, HashMap},
+    hash::BuildHasher,
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -13,7 +15,7 @@ use actix_web::{
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_RESPONSE: usize = 1_000_000;
 const MAX_PROMPT: usize = 8_000;
@@ -21,6 +23,27 @@ const MAX_PROMPT: usize = 8_000;
 pub struct Gateway {
     config: Option<Config>,
     permits: Arc<Semaphore>,
+    key_limits: KeyLimits,
+}
+
+#[derive(Default)]
+struct KeyLimits {
+    hash: RandomState,
+    active: Mutex<HashMap<u64, Weak<Semaphore>>>,
+}
+
+impl KeyLimits {
+    fn try_acquire(&self, key: &str) -> Option<OwnedSemaphorePermit> {
+        let id = self.hash.hash_one(key);
+        let mut active = self.active.lock().ok()?;
+        active.retain(|_, weak| weak.strong_count() > 0);
+        let semaphore = active.get(&id).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let semaphore = Arc::new(Semaphore::new(2));
+            active.insert(id, Arc::downgrade(&semaphore));
+            semaphore
+        });
+        semaphore.try_acquire_owned().ok()
+    }
 }
 
 struct Config {
@@ -92,6 +115,7 @@ impl Gateway {
         Self {
             config,
             permits: Arc::new(Semaphore::new(8)),
+            key_limits: KeyLimits::default(),
         }
     }
 
@@ -403,11 +427,21 @@ async fn execute(
             "Inference is busy. Try again.",
         ));
     };
-    let reservation = reserve(cfg, key, model).await?;
+    let Some(_key_permit) = gateway.key_limits.try_acquire(key) else {
+        return Err(failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BUSY",
+            "Inference is busy. Try again.",
+        ));
+    };
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let (mut outputs, mut input, mut output, mut finish_reason) = (Vec::new(), 0_u64, 0_u64, None);
     for messages in &batches {
+        // Every generation has its own reservation, so a batch cannot multiply
+        // the authority's per-key request limit.
+        let reservation = reserve(cfg, key, model).await?;
+        let call_started = Instant::now();
         match tokio::time::timeout_at(
             deadline,
             generate(cfg, &reservation, messages, max_tokens, temperature),
@@ -417,24 +451,35 @@ async fn execute(
             Ok(Ok((text, a, b, reason)))
                 if input + a <= i32::MAX as u64 && output + b <= i32::MAX as u64 =>
             {
+                if !finalize(
+                    cfg,
+                    &reservation.reservation_id,
+                    true,
+                    Some(a),
+                    Some(b),
+                    call_started.elapsed().as_millis().min(i32::MAX as u128) as u64,
+                )
+                .await
+                {
+                    return Err(failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "USAGE_UNAVAILABLE",
+                        "Usage could not be recorded.",
+                    ));
+                }
                 outputs.push(text);
                 input += a;
                 output += b;
                 finish_reason = reason;
             }
             _ => {
-                let partial = if outputs.is_empty() {
-                    (None, None)
-                } else {
-                    (Some(input), Some(output))
-                };
                 let recorded = finalize(
                     cfg,
                     &reservation.reservation_id,
                     false,
-                    partial.0,
-                    partial.1,
-                    started.elapsed().as_millis().min(i32::MAX as u128) as u64,
+                    None,
+                    None,
+                    call_started.elapsed().as_millis().min(i32::MAX as u128) as u64,
                 )
                 .await;
                 if !recorded {
@@ -453,22 +498,6 @@ async fn execute(
         }
     }
     let elapsed = started.elapsed().as_millis().min(i32::MAX as u128) as u64;
-    if !finalize(
-        cfg,
-        &reservation.reservation_id,
-        true,
-        Some(input),
-        Some(output),
-        elapsed,
-    )
-    .await
-    {
-        return Err(failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "USAGE_UNAVAILABLE",
-            "Usage could not be recorded.",
-        ));
-    }
     Ok(Completed {
         outputs,
         input,
@@ -573,13 +602,19 @@ mod tests {
 
     struct MockState {
         calls: AtomicUsize,
+        reserved: AtomicUsize,
+        reservation_limit: AtomicUsize,
         metered: AtomicUsize,
         fail_usage: AtomicBool,
         fail_after: AtomicUsize,
         partial_input: AtomicUsize,
     }
 
-    async fn mock_reserve(req: HttpRequest, body: web::Json<Value>) -> HttpResponse {
+    async fn mock_reserve(
+        req: HttpRequest,
+        state: web::Data<Arc<MockState>>,
+        body: web::Json<Value>,
+    ) -> HttpResponse {
         if req
             .headers()
             .get("X-Ekido-Inference-Token")
@@ -590,6 +625,11 @@ mod tests {
         }
         if body["api_key"] == "ek_test_wrong" {
             return HttpResponse::Unauthorized().finish();
+        }
+        if state.reserved.fetch_add(1, Ordering::SeqCst)
+            >= state.reservation_limit.load(Ordering::SeqCst)
+        {
+            return HttpResponse::TooManyRequests().finish();
         }
         HttpResponse::Ok().json(json!({"reservation_id": "12345678-1234-4234-8234-123456789012",
             "engine_url": format!("http://{}", req.connection_info().host()), "engine_model": "local"}))
@@ -645,6 +685,8 @@ mod tests {
     async fn setup() -> (Gateway, Arc<MockState>, actix_web::dev::ServerHandle) {
         let state = Arc::new(MockState {
             calls: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
+            reservation_limit: AtomicUsize::new(usize::MAX),
             metered: AtomicUsize::new(0),
             fail_usage: AtomicBool::new(false),
             fail_after: AtomicUsize::new(usize::MAX),
@@ -681,6 +723,7 @@ mod tests {
             Gateway {
                 config: Some(config),
                 permits: Arc::new(Semaphore::new(2)),
+                key_limits: KeyLimits::default(),
             },
             state,
             handle,
@@ -715,7 +758,8 @@ mod tests {
         assert_eq!(body["outputs"], json!(["answer", "answer"]));
         assert_eq!(body["usage"]["input_tokens"], 6);
         assert_eq!(state.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(state.metered.load(Ordering::SeqCst), 1);
+        assert_eq!(state.reserved.load(Ordering::SeqCst), 2);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 2);
         let request = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
@@ -796,8 +840,45 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(state.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(state.partial_input.load(Ordering::SeqCst), 3);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 1);
+        assert_eq!(state.partial_input.load(Ordering::SeqCst), 0);
         handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn a_batch_cannot_exceed_the_authority_rate_limit() {
+        let (gateway, state, handle) = setup().await;
+        state.reservation_limit.store(1, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two"]}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 1);
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn per_key_limit_releases_permits_and_keeps_keys_independent() {
+        let limits = KeyLimits::default();
+        let first = limits.try_acquire("customer-a").unwrap();
+        let second = limits.try_acquire("customer-a").unwrap();
+        assert!(limits.try_acquire("customer-a").is_none());
+        assert!(limits.try_acquire("customer-b").is_some());
+        drop(first);
+        assert!(limits.try_acquire("customer-a").is_some());
+        drop(second);
     }
 
     #[actix_web::test]
