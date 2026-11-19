@@ -350,6 +350,16 @@ async fn finalize(
     }
 }
 
+async fn cancel_reservations(cfg: &Config, reservations: &[Reservation]) -> bool {
+    let mut all_recorded = true;
+    for reservation in reservations {
+        if !finalize(cfg, &reservation.reservation_id, false, None, None, 0).await {
+            all_recorded = false;
+        }
+    }
+    all_recorded
+}
+
 async fn generate(
     cfg: &Config,
     reservation: &Reservation,
@@ -436,15 +446,28 @@ async fn execute(
     };
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut reservations = Vec::with_capacity(batches.len());
+    for _ in &batches {
+        match reserve(cfg, key, model).await {
+            Ok(reservation) => reservations.push(reservation),
+            Err(response) => {
+                if !cancel_reservations(cfg, &reservations).await {
+                    return Err(failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "USAGE_UNAVAILABLE",
+                        "Usage could not be recorded.",
+                    ));
+                }
+                return Err(response);
+            }
+        }
+    }
     let (mut outputs, mut input, mut output, mut finish_reason) = (Vec::new(), 0_u64, 0_u64, None);
-    for messages in &batches {
-        // Every generation has its own reservation, so a batch cannot multiply
-        // the authority's per-key request limit.
-        let reservation = reserve(cfg, key, model).await?;
+    for (index, (messages, reservation)) in batches.iter().zip(&reservations).enumerate() {
         let call_started = Instant::now();
         match tokio::time::timeout_at(
             deadline,
-            generate(cfg, &reservation, messages, max_tokens, temperature),
+            generate(cfg, reservation, messages, max_tokens, temperature),
         )
         .await
         {
@@ -461,6 +484,7 @@ async fn execute(
                 )
                 .await
                 {
+                    cancel_reservations(cfg, &reservations[index + 1..]).await;
                     return Err(failure(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "USAGE_UNAVAILABLE",
@@ -482,7 +506,8 @@ async fn execute(
                     call_started.elapsed().as_millis().min(i32::MAX as u128) as u64,
                 )
                 .await;
-                if !recorded {
+                let rest_recorded = cancel_reservations(cfg, &reservations[index + 1..]).await;
+                if !recorded || !rest_recorded {
                     return Err(failure(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "USAGE_UNAVAILABLE",
@@ -605,6 +630,7 @@ mod tests {
         reserved: AtomicUsize,
         reservation_limit: AtomicUsize,
         metered: AtomicUsize,
+        cancelled: AtomicUsize,
         fail_usage: AtomicBool,
         fail_after: AtomicUsize,
         partial_input: AtomicUsize,
@@ -631,7 +657,7 @@ mod tests {
         {
             return HttpResponse::TooManyRequests().finish();
         }
-        HttpResponse::Ok().json(json!({"reservation_id": "12345678-1234-4234-8234-123456789012",
+        HttpResponse::Ok().json(json!({"reservation_id": uuid::Uuid::new_v4().to_string(),
             "engine_url": format!("http://{}", req.connection_info().host()), "engine_model": "local"}))
     }
 
@@ -660,6 +686,7 @@ mod tests {
             state.metered.fetch_add(1, Ordering::SeqCst);
         }
         if body["status"] == "error" {
+            state.cancelled.fetch_add(1, Ordering::SeqCst);
             state.partial_input.store(
                 body["input_tokens"].as_u64().unwrap_or(0) as usize,
                 Ordering::SeqCst,
@@ -688,6 +715,7 @@ mod tests {
             reserved: AtomicUsize::new(0),
             reservation_limit: AtomicUsize::new(usize::MAX),
             metered: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
             fail_usage: AtomicBool::new(false),
             fail_after: AtomicUsize::new(usize::MAX),
             partial_input: AtomicUsize::new(0),
@@ -848,7 +876,58 @@ mod tests {
     #[actix_web::test]
     async fn a_batch_cannot_exceed_the_authority_rate_limit() {
         let (gateway, state, handle) = setup().await;
+        state.reservation_limit.store(2, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two", "three"]}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cancelled.load(Ordering::SeqCst), 2);
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn unstarted_batch_reservations_are_cancelled_when_engine_fails() {
+        let (gateway, state, handle) = setup().await;
+        state.fail_after.store(0, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two", "three"]}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cancelled.load(Ordering::SeqCst), 3);
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn failed_reservation_cleanup_returns_usage_error() {
+        let (gateway, state, handle) = setup().await;
         state.reservation_limit.store(1, Ordering::SeqCst);
+        state.fail_usage.store(true, Ordering::SeqCst);
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(gateway))
@@ -862,10 +941,10 @@ mod tests {
             .to_request();
         assert_eq!(
             test::call_service(&app, request).await.status(),
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(state.metered.load(Ordering::SeqCst), 1);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 0);
         handle.stop(false).await;
     }
 
