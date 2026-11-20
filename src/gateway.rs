@@ -463,7 +463,8 @@ async fn execute(
         }
     }
     let (mut outputs, mut input, mut output, mut finish_reason) = (Vec::new(), 0_u64, 0_u64, None);
-    for (index, (messages, reservation)) in batches.iter().zip(&reservations).enumerate() {
+    let mut pending_usage = Vec::with_capacity(reservations.len());
+    for (messages, reservation) in batches.iter().zip(&reservations) {
         let call_started = Instant::now();
         match tokio::time::timeout_at(
             deadline,
@@ -474,40 +475,18 @@ async fn execute(
             Ok(Ok((text, a, b, reason)))
                 if input + a <= i32::MAX as u64 && output + b <= i32::MAX as u64 =>
             {
-                if !finalize(
-                    cfg,
-                    &reservation.reservation_id,
-                    true,
-                    Some(a),
-                    Some(b),
+                pending_usage.push((
+                    a,
+                    b,
                     call_started.elapsed().as_millis().min(i32::MAX as u128) as u64,
-                )
-                .await
-                {
-                    cancel_reservations(cfg, &reservations[index + 1..]).await;
-                    return Err(failure(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "USAGE_UNAVAILABLE",
-                        "Usage could not be recorded.",
-                    ));
-                }
+                ));
                 outputs.push(text);
                 input += a;
                 output += b;
                 finish_reason = reason;
             }
             _ => {
-                let recorded = finalize(
-                    cfg,
-                    &reservation.reservation_id,
-                    false,
-                    None,
-                    None,
-                    call_started.elapsed().as_millis().min(i32::MAX as u128) as u64,
-                )
-                .await;
-                let rest_recorded = cancel_reservations(cfg, &reservations[index + 1..]).await;
-                if !recorded || !rest_recorded {
+                if !cancel_reservations(cfg, &reservations).await {
                     return Err(failure(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "USAGE_UNAVAILABLE",
@@ -520,6 +499,30 @@ async fn execute(
                     "Model inference failed.",
                 ));
             }
+        }
+    }
+    // Do not record any successful usage until every input has generated.
+    for (index, (reservation, (a, b, latency))) in
+        reservations.iter().zip(&pending_usage).enumerate()
+    {
+        if !finalize(
+            cfg,
+            &reservation.reservation_id,
+            true,
+            Some(*a),
+            Some(*b),
+            *latency,
+        )
+        .await
+        {
+            // An authority error can leave the current write ambiguous; attempt to
+            // cancel it and the remaining pending reservations before failing closed.
+            cancel_reservations(cfg, &reservations[index..]).await;
+            return Err(failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "USAGE_UNAVAILABLE",
+                "Usage could not be recorded.",
+            ));
         }
     }
     let elapsed = started.elapsed().as_millis().min(i32::MAX as u128) as u64;
@@ -634,6 +637,8 @@ mod tests {
         fail_usage: AtomicBool,
         fail_after: AtomicUsize,
         partial_input: AtomicUsize,
+        success_before_all_generated: AtomicBool,
+        error_with_tokens: AtomicBool,
     }
 
     async fn mock_reserve(
@@ -683,9 +688,17 @@ mod tests {
             return HttpResponse::ServiceUnavailable().finish();
         }
         if body["status"] == "ok" {
+            if state.calls.load(Ordering::SeqCst) < state.reserved.load(Ordering::SeqCst) {
+                state
+                    .success_before_all_generated
+                    .store(true, Ordering::SeqCst);
+            }
             state.metered.fetch_add(1, Ordering::SeqCst);
         }
         if body["status"] == "error" {
+            if !body["input_tokens"].is_null() || !body["output_tokens"].is_null() {
+                state.error_with_tokens.store(true, Ordering::SeqCst);
+            }
             state.cancelled.fetch_add(1, Ordering::SeqCst);
             state.partial_input.store(
                 body["input_tokens"].as_u64().unwrap_or(0) as usize,
@@ -719,6 +732,8 @@ mod tests {
             fail_usage: AtomicBool::new(false),
             fail_after: AtomicUsize::new(usize::MAX),
             partial_input: AtomicUsize::new(0),
+            success_before_all_generated: AtomicBool::new(false),
+            error_with_tokens: AtomicBool::new(false),
         });
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -788,6 +803,7 @@ mod tests {
         assert_eq!(state.calls.load(Ordering::SeqCst), 2);
         assert_eq!(state.reserved.load(Ordering::SeqCst), 2);
         assert_eq!(state.metered.load(Ordering::SeqCst), 2);
+        assert!(!state.success_before_all_generated.load(Ordering::SeqCst));
         let request = test::TestRequest::post()
             .uri("/v1/chat/completions")
             .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
@@ -849,7 +865,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn failed_batch_records_completed_calls() {
+    async fn failed_second_input_cancels_all_batch_usage() {
         let (gateway, state, handle) = setup().await;
         state.fail_after.store(1, Ordering::SeqCst);
         let app = test::init_service(
@@ -861,15 +877,42 @@ mod tests {
         let request = test::TestRequest::post()
             .uri("/v1/models/model1/predict")
             .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
-            .set_json(json!({"inputs": ["one", "two"]}))
+            .set_json(json!({"inputs": ["one", "two", "three"]}))
             .to_request();
-        assert_eq!(
-            test::call_service(&app, request).await.status(),
-            StatusCode::BAD_GATEWAY
-        );
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = test::read_body(response).await;
+        assert!(!String::from_utf8_lossy(&body).contains("answer"));
         assert_eq!(state.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(state.metered.load(Ordering::SeqCst), 1);
+        assert_eq!(state.reserved.load(Ordering::SeqCst), 3);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cancelled.load(Ordering::SeqCst), 3);
+        assert!(!state.error_with_tokens.load(Ordering::SeqCst));
         assert_eq!(state.partial_input.load(Ordering::SeqCst), 0);
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn failed_batch_cleanup_never_returns_partial_output() {
+        let (gateway, state, handle) = setup().await;
+        state.fail_after.store(1, Ordering::SeqCst);
+        state.fail_usage.store(true, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two", "three"]}))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!String::from_utf8_lossy(&test::read_body(response).await).contains("answer"));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 0);
         handle.stop(false).await;
     }
 
