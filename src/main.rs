@@ -10,6 +10,7 @@
 use actix_web::{App, HttpServer};
 use tracing_subscriber::EnvFilter;
 
+mod gateway;
 mod http;
 
 #[actix_web::main]
@@ -23,8 +24,15 @@ async fn main() -> std::io::Result<()> {
     let addr =
         std::env::var("EKIDO_INFERENCE_ADDR").unwrap_or_else(|_| "127.0.0.1:8020".to_string());
     tracing::info!(%addr, version = env!("CARGO_PKG_VERSION"), "inference service starting");
-    HttpServer::new(|| App::new().wrap(http::RequestId).configure(http::routes))
-        .bind(addr)?
-        .run()
-        .await
+    let gateway = actix_web::web::Data::new(gateway::Gateway::from_env());
+    HttpServer::new(move || {
+        App::new()
+            .app_data(gateway.clone())
+            .wrap(http::RequestId)
+            .configure(http::routes)
+            .configure(gateway::routes)
+    })
+    .bind(addr)?
+    .run()
+    .await
 }
