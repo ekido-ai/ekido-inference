@@ -360,6 +360,44 @@ async fn cancel_reservations(cfg: &Config, reservations: &[Reservation]) -> bool
     all_recorded
 }
 
+async fn finalize_batch(
+    cfg: &Config,
+    reservations: &[Reservation],
+    usage: &[(u64, u64, u64)],
+) -> bool {
+    if reservations.len() != usage.len() || reservations.is_empty() {
+        return false;
+    }
+    let Ok(url) = cfg.authority.join("/internal/inference/usage-batch") else {
+        return false;
+    };
+    let items: Vec<Value> = reservations
+        .iter()
+        .zip(usage)
+        .map(|(reservation, (input, output, latency))| {
+            json!({"reservation_id": reservation.reservation_id, "input_tokens": input,
+               "output_tokens": output, "latency_ms": latency})
+        })
+        .collect();
+    // Exact replays are idempotent at the authority; retry once after a lost
+    // response or server error, without re-running any model generation.
+    for _ in 0..2 {
+        match cfg
+            .client
+            .post(url.clone())
+            .header("X-Ekido-Inference-Token", &cfg.token)
+            .json(&json!({"items": items}))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return true,
+            Ok(response) if response.status().is_client_error() => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 async fn generate(
     cfg: &Config,
     reservation: &Reservation,
@@ -501,29 +539,15 @@ async fn execute(
             }
         }
     }
-    // Do not record any successful usage until every input has generated.
-    for (index, (reservation, (a, b, latency))) in
-        reservations.iter().zip(&pending_usage).enumerate()
-    {
-        if !finalize(
-            cfg,
-            &reservation.reservation_id,
-            true,
-            Some(*a),
-            Some(*b),
-            *latency,
-        )
-        .await
-        {
-            // An authority error can leave the current write ambiguous; attempt to
-            // cancel it and the remaining pending reservations before failing closed.
-            cancel_reservations(cfg, &reservations[index..]).await;
-            return Err(failure(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "USAGE_UNAVAILABLE",
-                "Usage could not be recorded.",
-            ));
-        }
+    // Commit all successful usage in one authority transaction only after all
+    // inputs generated. An ambiguous network failure may still require reconciliation.
+    if !finalize_batch(cfg, &reservations, &pending_usage).await {
+        cancel_reservations(cfg, &reservations).await;
+        return Err(failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "USAGE_UNAVAILABLE",
+            "Usage could not be recorded.",
+        ));
     }
     let elapsed = started.elapsed().as_millis().min(i32::MAX as u128) as u64;
     Ok(Completed {
@@ -639,6 +663,8 @@ mod tests {
         partial_input: AtomicUsize,
         success_before_all_generated: AtomicBool,
         error_with_tokens: AtomicBool,
+        batch_calls: AtomicUsize,
+        batch_failures: AtomicUsize,
     }
 
     async fn mock_reserve(
@@ -708,6 +734,37 @@ mod tests {
         HttpResponse::Ok().finish()
     }
 
+    async fn mock_batch_usage(
+        req: HttpRequest,
+        state: web::Data<Arc<MockState>>,
+        body: web::Json<Value>,
+    ) -> HttpResponse {
+        if req
+            .headers()
+            .get("X-Ekido-Inference-Token")
+            .and_then(|h| h.to_str().ok())
+            != Some("internal-test-token-12345678901234567890")
+        {
+            return HttpResponse::Unauthorized().finish();
+        }
+        let attempt = state.batch_calls.fetch_add(1, Ordering::SeqCst);
+        if state.fail_usage.load(Ordering::SeqCst)
+            || attempt < state.batch_failures.load(Ordering::SeqCst)
+        {
+            return HttpResponse::ServiceUnavailable().finish();
+        }
+        let Some(items) = body["items"].as_array() else {
+            return HttpResponse::BadRequest().finish();
+        };
+        if state.calls.load(Ordering::SeqCst) < state.reserved.load(Ordering::SeqCst) {
+            state
+                .success_before_all_generated
+                .store(true, Ordering::SeqCst);
+        }
+        state.metered.fetch_add(items.len(), Ordering::SeqCst);
+        HttpResponse::Ok().finish()
+    }
+
     async fn mock_engine(state: web::Data<Arc<MockState>>, body: web::Json<Value>) -> HttpResponse {
         if body["model"] != "local" {
             return HttpResponse::BadRequest().finish();
@@ -734,6 +791,8 @@ mod tests {
             partial_input: AtomicUsize::new(0),
             success_before_all_generated: AtomicBool::new(false),
             error_with_tokens: AtomicBool::new(false),
+            batch_calls: AtomicUsize::new(0),
+            batch_failures: AtomicUsize::new(0),
         });
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -744,6 +803,10 @@ mod tests {
                 .route("/internal/inference/reserve", web::post().to(mock_reserve))
                 .route("/internal/inference/ready", web::get().to(mock_ready))
                 .route("/internal/inference/usage/{id}", web::post().to(mock_usage))
+                .route(
+                    "/internal/inference/usage-batch",
+                    web::post().to(mock_batch_usage),
+                )
                 .route("/health", web::get().to(mock_health))
                 .route("/v1/chat/completions", web::post().to(mock_engine))
         })
@@ -889,6 +952,57 @@ mod tests {
         assert_eq!(state.cancelled.load(Ordering::SeqCst), 3);
         assert!(!state.error_with_tokens.load(Ordering::SeqCst));
         assert_eq!(state.partial_input.load(Ordering::SeqCst), 0);
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn batch_authority_failure_cancels_all_and_returns_no_output() {
+        let (gateway, state, handle) = setup().await;
+        state.batch_failures.store(2, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two", "three"]}))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!String::from_utf8_lossy(&test::read_body(response).await).contains("answer"));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(state.batch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cancelled.load(Ordering::SeqCst), 3);
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn batch_authority_retry_does_not_regenerate_inputs() {
+        let (gateway, state, handle) = setup().await;
+        state.batch_failures.store(1, Ordering::SeqCst);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(gateway))
+                .configure(routes),
+        )
+        .await;
+        let request = test::TestRequest::post()
+            .uri("/v1/models/model1/predict")
+            .insert_header((header::AUTHORIZATION, "Bearer ek_test_valid"))
+            .set_json(json!({"inputs": ["one", "two"]}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.batch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.metered.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cancelled.load(Ordering::SeqCst), 0);
         handle.stop(false).await;
     }
 
