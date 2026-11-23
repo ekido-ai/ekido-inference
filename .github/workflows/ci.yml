@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets anyone with write access re-run CI on main by hand. On 23 Nov the push of 947a432 started no run, so the
+  # release's required check never appeared and auto-deploy waited on it for hours.
+  workflow_dispatch:
 
 permissions:
   contents: read
